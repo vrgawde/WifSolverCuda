@@ -8,6 +8,12 @@
 #include "lib/Math.cuh"
 
 
+struct MiniResult {
+    uint64_t index;
+    uint8_t priv[32];
+};
+
+
 __global__ void kernelUncompressed(bool* buffResult, bool* buffCollectorWork, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks);
 __global__ void kernelCompressed(bool* buffResult, bool* buffCollectorWork, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks);
 __global__ void kernelUncompressed(bool* buffResult, bool* buffCollectorWork, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks, const uint32_t checksum);
@@ -18,6 +24,8 @@ __global__ void kernelCompressed(const int gpuIx, uint32_t* unifiedResult, bool*
 __global__ void kernelCompressed(const int gpuIx, uint32_t* unifiedResult, bool* isResultFlag, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks, const uint32_t checksum);
 __global__ void kernelUncompressed(const int gpuIx, uint32_t* unifiedResult, bool* isResultFlag, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks);
 __global__ void kernelUncompressed(const int gpuIx, uint32_t* unifiedResult, bool* isResultFlag, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks, const uint32_t checksum);
+
+__global__ void kernelMinikey(const uint8_t* startDigits, MiniResult* results, uint32_t* resultCount, bool* isResultFlag, uint64_t total, const int threadNumberOfChecks);
 
 __device__ bool _checksumDoubleSha256CheckUncompressed(unsigned int checksum, beu32* d_hash, uint64_t* _start);
 __device__ bool _checksumDoubleSha256CheckCompressed(unsigned int checksum, beu32* d_hash, uint64_t* _start);

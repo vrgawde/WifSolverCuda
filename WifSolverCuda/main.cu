@@ -11,6 +11,8 @@
 #include <chrono>
 #include <thread>
 #include <set>
+#include <algorithm>
+#include <string.h>
 
 #include "lib/ctpl/ctpl_stl.h"
 #include "lib/Int.h"
@@ -20,11 +22,19 @@
 #include "Worker.cuh"
 
 #include "lib/SECP256k1.h"
+#include "lib/hash/sha256.h"
 
 using namespace std;
 
 void processCandidate(Int& toTest);
 void processCandidateThread(int id, uint64_t bit0, uint64_t bit1, uint64_t bit2, uint64_t bit3, uint64_t bit4);
+void processMinikeyCandidate(Int& priv, const std::string& mini);
+void bruteForceMinikey(const std::string& start, const std::string& end);
+bool incrementBase58(std::string& s);
+void toDigits(const std::string& s, uint8_t digits[22]);
+uint64_t distanceBase58(const uint8_t* start, const uint8_t* end);
+void addBase58Host(uint8_t* digits, uint64_t add);
+std::string offsetToMini(const uint8_t* startDigits, uint64_t offset);
 bool readArgs(int argc, char** argv);
 bool readFileAddress(const std::string& file_name);
 void showHelp();
@@ -92,6 +102,10 @@ bool IS_VERBOSE = false;
 
 Secp256K1* secp;
 
+bool MINIKEY_MODE = false;
+std::string MINIKEY_START;
+std::string MINIKEY_END;
+
 ctpl::thread_pool pool(2);
 
 int main(int argc, char** argv)
@@ -114,9 +128,16 @@ int main(int argc, char** argv)
         printFooter();
         return 0;
     }
+    if (MINIKEY_MODE) {
+        secp = new Secp256K1();
+        secp->Init();
+        bruteForceMinikey(MINIKEY_START, MINIKEY_END);
+        printFooter();
+        return 0;
+    }
     if (isRestore) {
         restoreSettings(fileStatusRestore);
-    }   
+    }
 
     dataLen = COMPRESSED ? 38 : 37;
     if (!isRANGE_START_TOTAL) {
@@ -802,6 +823,141 @@ void processCandidateThread(int id, uint64_t bit0, uint64_t bit1, uint64_t bit2,
     delete toTest;
 }
 
+void processMinikeyCandidate(Int& priv, const std::string& mini) {
+    FILE* keys;
+    char rmdhash[21], address[128];
+    Point publickey = secp->ComputePublicKey(&priv);
+    if (bech32) {
+        char output[128];
+        uint8_t h160[20];
+        secp->GetHash160(BECH32, true, publickey, h160);
+        segwit_addr_encode(output, "bc", 0, h160, 20);
+        string addressBech32 = std::string(output);
+        strcpy(address, addressBech32.c_str());
+    }
+    else {
+        if (p2sh) {
+            secp->GetHash160(P2SH, true, publickey, (unsigned char*)rmdhash);
+        }
+        else {
+            secp->GetHash160(P2PKH, COMPRESSED, publickey, (unsigned char*)rmdhash);
+        }
+        addressToBase58(rmdhash, address, p2sh);
+    }
+    if (IS_TARGET_ADDRESS) {
+        if (addresses.find(address) != addresses.end()) {
+            RESULT = true;
+            printf("\n");
+            printf("found: %s\n", address);
+            printf("key  : %s\n", priv.GetBase16().c_str());
+            printf("mini : %s\n", mini.c_str());
+            keys = fopen(fileResult.c_str(), "a+");
+            fprintf(keys, "%s\n", address);
+            fprintf(keys, "%s\n", mini.c_str());
+            fprintf(keys, "%s\n\n", priv.GetBase16().c_str());
+            fclose(keys);
+        }
+    }
+    else {
+        printf("\n");
+        printf("found: %s\n", address);
+        printf("key  : %s\n", priv.GetBase16().c_str());
+        printf("mini : %s\n", mini.c_str());
+        keys = fopen(fileResultPartial.c_str(), "a+");
+        fprintf(keys, "%s\n", address);
+        fprintf(keys, "%s\n", mini.c_str());
+        fprintf(keys, "%s\n\n", priv.GetBase16().c_str());
+        fclose(keys);
+    }
+}
+
+bool incrementBase58(std::string& s) {
+    static const std::string alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    for (int i = s.size() - 1; i >= 0; --i) {
+        size_t pos = alphabet.find(s[i]);
+        if (pos == std::string::npos) return false;
+        pos++;
+        if (pos < alphabet.size()) {
+            s[i] = alphabet[pos];
+            return true;
+        }
+        s[i] = alphabet[0];
+    }
+    return false;
+}
+
+void toDigits(const std::string& s, uint8_t digits[22]) {
+    static const std::string alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    for (int i = 0; i < 22; ++i) {
+        digits[i] = alphabet.find(s[i]);
+    }
+}
+
+uint64_t distanceBase58(const uint8_t* start, const uint8_t* end) {
+    uint64_t s = 0, e = 0;
+    for (int i = 0; i < 22; ++i) {
+        s = s * 58 + start[i];
+        e = e * 58 + end[i];
+    }
+    return e - s;
+}
+
+void addBase58Host(uint8_t* digits, uint64_t add) {
+    for (int i = 21; i >= 0 && add; --i) {
+        uint64_t sum = digits[i] + (add % 58);
+        digits[i] = sum % 58;
+        add = add / 58 + sum / 58;
+    }
+}
+
+std::string offsetToMini(const uint8_t* startDigits, uint64_t offset) {
+    static const std::string alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    uint8_t digits[22];
+    memcpy(digits, startDigits, 22);
+    addBase58Host(digits, offset);
+    std::string s(22, '1');
+    for (int i = 0; i < 22; ++i) {
+        s[i] = alphabet[digits[i]];
+    }
+    return s;
+}
+
+void bruteForceMinikey(const std::string& start, const std::string& end) {
+    uint8_t startDigits[22], endDigits[22];
+    toDigits(start, startDigits);
+    toDigits(end, endDigits);
+    uint64_t total = distanceBase58(startDigits, endDigits) + 1;
+    uint64_t capacity = (uint64_t)BLOCK_NUMBER * BLOCK_THREADS * THREAD_STEPS;
+    MiniResult* results;
+    uint32_t* count;
+    bool* flag;
+    cudaMallocManaged(&results, sizeof(MiniResult) * BLOCK_NUMBER * BLOCK_THREADS);
+    cudaMallocManaged(&count, sizeof(uint32_t));
+    cudaMallocManaged(&flag, sizeof(bool));
+    uint8_t* d_start;
+    cudaMalloc(&d_start, 22);
+    uint64_t processed = 0;
+    while (processed < total && !RESULT) {
+        uint64_t batch = min(capacity, total - processed);
+        cudaMemcpy(d_start, startDigits, 22, cudaMemcpyHostToDevice);
+        *count = 0; *flag = false;
+        kernelMinikey<<<BLOCK_NUMBER, BLOCK_THREADS>>>(d_start, results, count, flag, batch, THREAD_STEPS);
+        cudaDeviceSynchronize();
+        for (uint32_t i = 0; i < *count; ++i) {
+            std::string mini = offsetToMini(startDigits, results[i].index);
+            Int priv; priv.Set32Bytes(results[i].priv);
+            processMinikeyCandidate(priv, mini);
+            if (RESULT) break;
+        }
+        addBase58Host(startDigits, batch);
+        processed += batch;
+    }
+    cudaFree(d_start);
+    cudaFree(results);
+    cudaFree(count);
+    cudaFree(flag);
+}
+
 void printConfig() {
     printf("Range start: %s\n", RANGE_START_TOTAL.GetBase16().c_str());
     printf("Range end  : %s\n", RANGE_END.GetBase16().c_str());
@@ -894,6 +1050,7 @@ void showHelp()  {
     printf("    -stride hexKeyStride -rangeStart hexKeyStart [-rangeEnd hexKeyEnd] [-checksum hexChecksum] \n");
     printf("    -wifStart wifKeyStart [-wifEnd wifKeyEnd]\n");
     printf("    [-decode wifToDecode] \n");
+    printf("    [-mini miniStart miniEnd] \n");
     printf("    [-restore statusFile] \n");
     printf("    [-listDevices] \n");
     printf("    [-v] \n");
@@ -944,6 +1101,14 @@ bool readArgs(int argc, char** argv) {
             WIF_TO_DECODE = string(argv[a]);
             DECODE = true;
             return false;
+        }
+        else if (strcmp(argv[a], "-mini") == 0) {
+            if (a + 2 >= argc) {
+                return true;
+            }
+            MINIKEY_MODE = true;
+            MINIKEY_START = string(argv[++a]);
+            MINIKEY_END = string(argv[++a]);
         }
         else if (strcmp(argv[a], "-listDevices") == 0) {
             showDevices = true;

@@ -3,6 +3,7 @@
 __device__ __constant__ uint64_t _stride[5];
 __device__ __shared__ uint32_t _blockResults[4096];
 __device__ __shared__ bool _blockResultFlag[1];
+__device__ __constant__ char _base58Alphabet[58] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 __global__ void kernelUncompressed(bool* buffResult, bool* buffCollectorWork, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks, const uint32_t checksum) {
     uint64_t _start[5];
@@ -189,6 +190,58 @@ __global__ void kernelCompressed(const int gpuIx, uint32_t* unifiedResult, bool*
         _add(_start, _stride);
     }
     summaryShared(gpuIx, unifiedResult, isResultFlag);
+}
+
+__device__ __forceinline__ void _miniAdd(uint8_t* digits, uint64_t add) {
+    for (int i = 21; i >= 0 && add; --i) {
+        uint64_t sum = digits[i] + (add % 58);
+        digits[i] = sum % 58;
+        add = add / 58 + sum / 58;
+    }
+}
+
+__device__ __forceinline__ void _miniIncrement(uint8_t* digits) {
+    for (int i = 21; i >= 0; --i) {
+        if (++digits[i] < 58) {
+            return;
+        }
+        digits[i] = 0;
+    }
+}
+
+__global__ void kernelMinikey(const uint8_t* startDigits, MiniResult* results, uint32_t* resultCount, bool* isResultFlag, uint64_t total, const int threadNumberOfChecks) {
+    uint64_t tIx = (threadIdx.x + blockIdx.x * blockDim.x) * (uint64_t)threadNumberOfChecks;
+    if (tIx >= total) {
+        return;
+    }
+    uint8_t digits[22];
+    for (int i = 0; i < 22; ++i) {
+        digits[i] = startDigits[i];
+    }
+    _miniAdd(digits, tIx);
+    for (uint32_t i = 0; i < threadNumberOfChecks && (tIx + i) < total; ++i) {
+        char key[22];
+        for (int j = 0; j < 22; ++j) {
+            key[j] = _base58Alphabet[digits[j]];
+        }
+        uint8_t temp[23];
+        for (int j = 0; j < 22; ++j) {
+            temp[j] = (uint8_t)key[j];
+        }
+        temp[22] = '?';
+        uint8_t digest[32];
+        sha256(temp, 23, digest);
+        if (digest[0] == 0x00) {
+            sha256((uint8_t*)key, 22, digest);
+            uint32_t slot = atomicAdd(resultCount, 1u);
+            results[slot].index = tIx + i;
+            for (int b = 0; b < 32; ++b) {
+                results[slot].priv[b] = digest[b];
+            }
+            *isResultFlag = true;
+        }
+        _miniIncrement(digits);
+    }
 }
 
 __device__ __inline__ void initShared() {
