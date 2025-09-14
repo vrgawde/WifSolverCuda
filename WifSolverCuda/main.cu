@@ -93,6 +93,256 @@ bool IS_VERBOSE = false;
 Secp256K1* secp;
 
 ctpl::thread_pool pool(2);
+// main.cu
+// --------
+// Full replacement for bruteForceMiniRange() that DOES NOT use sha256_checksum.
+// It takes the 32-byte privkey returned by kernelMini and sends it to processCandidate().
+
+#include <cstdint>
+#include <cstring>
+#include <sstream>
+#include <iomanip>
+
+// externs you already have elsewhere
+extern bool RESULT;
+extern unsigned int BLOCK_THREADS;
+extern unsigned int BLOCK_NUMBER;
+extern unsigned int THREAD_STEPS;
+bool IS_MINI = false;
+std::string MINI_START;
+std::string MINI_END;
+extern bool COMPRESSED;
+
+// ===== 128-bit helpers for decimal index parsing (MSVC-safe; no __int128 needed) =====
+struct U128 { uint64_t hi{ 0 }, lo{ 0 }; };
+
+static inline void u128_sub_u64(U128& a, uint64_t x) {
+    uint64_t old = a.lo; a.lo -= x; a.hi -= (old < x) ? 1ull : 0ull;
+}
+
+static inline bool u128_from_dec(const char* s, U128& out) {
+    out.hi = out.lo = 0;
+    for (const char* p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return false;
+#if defined(_MSC_VER) && defined(_M_X64)
+        unsigned __int64 carry;
+        unsigned __int64 loMul = _umul128(out.lo, 10ull, &carry);
+        unsigned __int64 hiMul = out.hi * 10ull + carry;
+        out.lo = loMul; out.hi = hiMul;
+        uint8_t d = (uint8_t)(*p - '0');
+        uint64_t old = out.lo; out.lo += d; out.hi += (out.lo < old) ? 1ull : 0ull;
+#else
+        __uint128_t v = ((__uint128_t)out.hi << 64) | out.lo;
+        v = v * 10 + (uint8_t)(*p - '0');
+        out.hi = (uint64_t)(v >> 64);
+        out.lo = (uint64_t)(v);
+#endif
+    }
+    return true;
+}
+
+// divide 128-bit by 32-bit; return quotient and remainder (long division on 4x32 limbs)
+static inline void u128_divmod_u32(const U128& in, uint32_t d, U128& q, uint32_t& r) {
+    uint32_t w[4] = {
+        (uint32_t)(in.hi >> 32), (uint32_t)(in.hi & 0xffffffffu),
+        (uint32_t)(in.lo >> 32), (uint32_t)(in.lo & 0xffffffffu)
+    };
+    uint32_t qo[4] = { 0,0,0,0 };
+    uint64_t rem = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint64_t cur = (rem << 32) | w[i];
+        qo[i] = (uint32_t)(cur / d);
+        rem = (uint32_t)(cur % d);
+    }
+    r = (uint32_t)rem;
+    q.hi = ((uint64_t)qo[0] << 32) | qo[1];
+    q.lo = ((uint64_t)qo[2] << 32) | qo[3];
+}
+
+// 1-based decimal index -> 22-char mini-key string ("S....................")
+static inline std::string indexToMiniKey22_fromU128(const U128& idx1) {
+    static const char ALPH[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    U128 n = idx1; u128_sub_u64(n, 1ull);       // make zero-based
+    uint8_t digits[22];                         // 0..57 per position
+    // Note: kernel hardcodes 'S' for char[0], so we only care about characters here
+    for (int pos = 21; pos >= 1; --pos) {
+        U128 q; uint32_t rem;
+        u128_divmod_u32(n, 58u, q, rem);
+        digits[pos] = (uint8_t)rem;
+        n = q;
+    }
+    std::string out; out.resize(22);
+    out[0] = 'S';
+    for (int i = 1; i < 22; ++i) out[i] = ALPH[digits[i]];
+    return out;
+}
+
+
+// --- helpers (keep or place near your other helpers) -----------------------
+static inline int b58_index(char c) {
+    static const char ALPH[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+    for (int i = 0; i < 58; ++i) if (ALPH[i] == c) return i;
+    return -1;
+}
+
+static inline void stringToDigits(const std::string& s, uint8_t* out22) {
+    // Expect s.size()==22 and s[0]=='S'
+    out22[0] = (uint8_t)b58_index('S'); // usually 25
+    for (int i = 1; i < 22; ++i) {
+        int ix = b58_index(s[i]);
+        out22[i] = (uint8_t)((ix < 0) ? 0 : ix);
+    }
+}
+
+static inline void addDigitsHost(uint8_t* digits22, uint64_t add) {
+    int i = 21;
+    while (add && i >= 0) {
+        uint64_t total = (uint64_t)digits22[i] + add;
+        digits22[i] = (uint8_t)(total % 58ull);
+        add = total / 58ull;
+        --i;
+    }
+}
+
+static inline int compareDigits(const uint8_t* a, const uint8_t* b) {
+    for (int i = 0; i < 22; ++i) {
+        if (a[i] != b[i]) return (a[i] < b[i]) ? -1 : 1;
+    }
+    return 0;
+}
+
+// --- GPU kernel (declared in Worker.cuh / defined in Worker1.cu) ----------
+__global__ void kernelMini(
+    int gpuIx,
+    uint8_t* __restrict__ unifiedKey,
+    int* __restrict__ isResultFlag,
+    const uint8_t* __restrict__ startDigits,
+    int threadNumberOfChecks,
+    unsigned long long* __restrict__ foundOffset);
+
+// Thread wrapper that accepts hex and runs the same CPU pipeline as processCandidate(...)
+void processCandidateHexThread(int id, std::string hex) {
+    //std::cout << hex << endl;
+    Int candidate;
+    candidate.SetBase16((char*)hex.c_str());
+    processCandidate(candidate);
+}
+
+
+// Threaded mini-key scan driver
+void bruteForceMiniRange() {
+    // Convert CLI strings to 22 base-58 digit arrays
+    uint8_t start[22], end[22];
+    
+    stringToDigits(MINI_START, start);
+    stringToDigits(MINI_END, end);
+
+    // Managed buffers shared with GPU
+    uint8_t* devStart = nullptr;   // 22 digits (base-58 indexes)
+    uint8_t* devKey = nullptr;   // 32-byte privkey if found
+    int* devFound = nullptr;   // flag
+
+    uint64_t* devOffset = nullptr;
+    cudaMallocManaged(&devOffset, sizeof(uint64_t));
+
+    cudaMallocManaged(&devStart, 22);
+    cudaMallocManaged(&devKey, 32);
+    cudaMallocManaged(&devFound, sizeof(int));
+
+    // One launch covers this many candidates:
+    const uint64_t chunk = (uint64_t)BLOCK_NUMBER * (uint64_t)BLOCK_THREADS * (uint64_t)THREAD_STEPS;
+
+    // Simple stats
+    auto beginCountHashrate = std::chrono::steady_clock::now();
+    uint64_t counter = 0;
+
+    printf("\n");
+    printf("number of blocks: %u\n", BLOCK_NUMBER);
+    printf("number of threads: %u\n", BLOCK_THREADS);
+    printf("number of checks per thread: %u\n\n", THREAD_STEPS);
+
+    while (compareDigits(start, end) <= 0 && !RESULT) {
+      /*  static const char* B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        std::cout << "start b58: S";
+        for (int i = 1; i < 22; ++i) std::cout << B58[start[i]];
+        std::cout << "\n";
+
+        std::cout << "start b58: S";
+        for (int i = 1; i < 22; ++i) std::cout << B58[end[i]];
+        std::cout << "\n";*/
+
+        // launch one chunk from current 'start'
+        std::memcpy(devStart, start, 22);
+        *devFound = 0;
+        //printf("launching kernel");
+        kernelMini << <BLOCK_NUMBER, BLOCK_THREADS >> > (0, devKey, devFound, devStart, (int)THREAD_STEPS, devOffset);
+        cudaError_t la = cudaPeekAtLastError();
+        if (la != cudaSuccess) {
+            fprintf(stderr, "Launch error: %s\n", cudaGetErrorString(la));
+        }
+        cudaError_t sync = cudaDeviceSynchronize();
+        if (sync != cudaSuccess) {
+            fprintf(stderr, "Sync error: %s\n", cudaGetErrorString(sync));
+        }
+        cudaError_t cudaStatus = cudaDeviceSynchronize();
+        if (cudaStatus != cudaSuccess) {
+            fprintf(stderr, "cudaDeviceSynchronize returned error %d in mini driver\n", cudaStatus);
+            break;
+        }
+
+        counter += chunk;
+        //printf("chunk=%llu\n", (unsigned long long)chunk);
+        // optional: show speed every ~5s, just like the other loops
+        auto now = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - beginCountHashrate).count();
+        if (ms >= 5000) {
+            printSpeed((double)((double)counter / ms) / 1000.0);
+            counter = 0;
+            beginCountHashrate = now;
+        }
+
+        if (*devFound != 0) {
+            // devKey holds the 32-byte private key in big-endian byte order.
+            // Convert to hex and push to the threaded CPU pipeline.
+            std::ostringstream hex;
+            hex << std::hex << std::setfill('0');
+            for (int i = 0; i < 32; ++i) hex << std::setw(2) << (int)devKey[i];
+
+            // Retrieve the formatted string
+            //std::string hex_string = hex.str();
+
+            //// Print the result
+            //std::cout << "Hexadecimal (basic): " << hex_string << std::endl;
+
+            // Enqueue for CPU processing (priv -> pub -> addr -> match)
+            pool.push(processCandidateHexThread, hex.str());
+
+            addDigitsHost(start, (*devOffset) + 1ULL);
+            /*static const char* B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+            std::cout << "start b58: S";
+            for (int i = 1; i < 22; ++i) std::cout << B58[start[i]];
+            std::cout << "\n";*/
+            continue;
+        }
+
+        // advance the base-58 counter by one chunk
+        addDigitsHost(start, chunk);
+        
+    }
+
+    // Drain any remaining CPU tasks before exiting
+    while (!pool.isQueueEmpty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    pool.clear_queue();
+
+    cudaFree(devStart);
+    cudaFree(devKey);
+    cudaFree(devFound);
+}
+
+
+
 
 int main(int argc, char** argv)
 {    
@@ -116,7 +366,11 @@ int main(int argc, char** argv)
     }
     if (isRestore) {
         restoreSettings(fileStatusRestore);
-    }   
+    }
+    if (IS_MINI) {
+        if (MINI_START.empty()) { fprintf(stderr, "Mini mode requires -miniStartIndex (or -miniStart)\n"); return true; }
+        if (MINI_END.empty()) { MINI_END = MINI_START; }  // allow single-point window
+    }
 
     dataLen = COMPRESSED ? 38 : 37;
     if (!isRANGE_START_TOTAL) {
@@ -132,7 +386,15 @@ int main(int argc, char** argv)
     if (!checkDevice()) {
         return -1;
     }
-    printConfig();
+    if (!IS_MINI) {
+        printConfig();
+    }
+    else {
+        printf("Mini-key index mode\n");
+        printf("  start mini-key: %s\n", MINI_START.c_str());
+        printf("  end   mini-key: %s\n", MINI_END.c_str());
+        printf("  blocks=%u threads=%u steps=%u\n\n", BLOCK_NUMBER, BLOCK_THREADS, THREAD_STEPS);
+    }
 
     secp = new Secp256K1();
     secp->Init();
@@ -142,16 +404,23 @@ int main(int argc, char** argv)
     std::cout << "Work started at " << std::ctime(&s_time);
 
     cudaError_t cudaStatus;
-    if (unifiedMemory) {
-        if (DEVICE_NR == -1) {
-            cudaStatus = processCudaUnifiedMulti();
-        }
-        else {
-            cudaStatus = processCudaUnified();
-        }
+    if (IS_MINI) {
+        // Mini-key path: use the GPU mini kernel driver you already have
+        bruteForceMiniRange();
+        cudaStatus = cudaSuccess;
     }
     else {
-        cudaStatus = processCuda();
+        if (unifiedMemory) {
+            if (DEVICE_NR == -1) {
+                cudaStatus = processCudaUnifiedMulti();
+            }
+            else {
+                cudaStatus = processCudaUnified();
+            }
+        }
+        else {
+            cudaStatus = processCuda();
+        }
     }
     
     time = std::chrono::system_clock::now();
@@ -741,7 +1010,7 @@ void processCandidate(Int &toTest) {
     for (int i = 0, d=dataLen-1; i < dataLen; i++, d--) {
         buff[i] = toTest.GetByte(d);
     }       
-    toTest.SetBase16((char*)toTest.GetBase16().substr(2, 64).c_str());        
+    //toTest.SetBase16((char*)toTest.GetBase16().substr(2, 64).c_str());        
     Point publickey = secp->ComputePublicKey(&toTest);
     if (bech32){
         char output[128];
@@ -759,10 +1028,13 @@ void processCandidate(Int &toTest) {
             secp->GetHash160(P2PKH, COMPRESSED, publickey, (unsigned char*)rmdhash);
         }
         addressToBase58(rmdhash, address, p2sh);
-    }   
+    }
+    //printf("Address: \n");
+    //printf(address);
+    //printf("\n");
     if (IS_TARGET_ADDRESS) {
         if (addresses.find(address) != addresses.end()) {
-            RESULT = true;            
+            //RESULT = true;            
             printf("\n");
             printf("found: %s\n", address);
             printf("key  : %s\n", toTest.GetBase16().c_str());
@@ -1075,6 +1347,22 @@ bool readArgs(int argc, char** argv) {
         else if (strcmp(argv[a], "-v") == 0) {
         IS_VERBOSE = true;
         }
+        else if (strcmp(argv[a], "-miniStartIndex") == 0) {
+            a++;
+            U128 idx;
+            if (!u128_from_dec(argv[a], idx)) { fprintf(stderr, "Invalid -miniStartIndex\n"); return true; }
+            MINI_START = indexToMiniKey22_fromU128(idx);
+            IS_MINI = true;
+            std::cout << MINI_START << endl;
+            }
+        else if (strcmp(argv[a], "-miniEndIndex") == 0) {
+                a++;
+                U128 idx;
+                if (!u128_from_dec(argv[a], idx)) { fprintf(stderr, "Invalid -miniEndIndex\n"); return true; }
+                MINI_END = indexToMiniKey22_fromU128(idx);
+                IS_MINI = true;
+                std::cout << MINI_END << endl;
+                }
         a++;
     }    
 

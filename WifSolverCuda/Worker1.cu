@@ -1,8 +1,170 @@
-#include "Worker.cuh"
+﻿#include "Worker.cuh"
+#include <cstdio>
+#include <cstdint>
+
 
 __device__ __constant__ uint64_t _stride[5];
 __device__ __shared__ uint32_t _blockResults[4096];
 __device__ __shared__ bool _blockResultFlag[1];
+__device__ __constant__ char _b58Alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+// Add 'add' in base-58 to a 22-digit (0..57) array IN-PLACE.
+__device__ __forceinline__ void addUint64ToDigits(uint8_t* digits, uint64_t add) {
+    int i = 21; // last position
+    while (add && i >= 0) {
+        uint64_t total = digits[i] + add;
+        digits[i] = total % 58ull;
+        add = total / 58ull;
+        i--;
+    }
+}
+
+// ++digits in base-58 (carry)
+__device__ void incrementDigits(uint8_t* digits) {
+    int i = 21;
+    while (i >= 0) {
+        if (digits[i] < 57) {
+            digits[i]++;
+            return;
+        }
+        digits[i] = 0;
+        i--;
+    }
+}
+
+// One-block SHA-256 for ASCII input up to 23/31 bytes, storing BE words in `hash[0..7]`.
+__device__ void sha256MiniBlock(const char* input, int len, beu32* hash) {
+    beu32 w0 = ((beu32)input[0] << 24) | ((beu32)input[1] << 16) | ((beu32)input[2] << 8) | (uint8_t)input[3];
+    beu32 w1 = ((beu32)input[4] << 24) | ((beu32)input[5] << 16) | ((beu32)input[6] << 8) | (uint8_t)input[7];
+    beu32 w2 = ((beu32)input[8] << 24) | ((beu32)input[9] << 16) | ((beu32)input[10] << 8) | (uint8_t)input[11];
+    beu32 w3 = ((beu32)input[12] << 24) | ((beu32)input[13] << 16) | ((beu32)input[14] << 8) | (uint8_t)input[15];
+    beu32 w4 = ((beu32)input[16] << 24) | ((beu32)input[17] << 16) | ((beu32)input[18] << 8) | (uint8_t)input[19];
+
+    // pad at w5 depending on len 22 vs 23 (S + 21 chars) or (S + 21 chars + '?')
+    beu32 w5;
+    if (len == 22) {
+        w5 = ((beu32)input[20] << 24) | ((beu32)input[21] << 16) | 0x00008000;
+    }
+    else {
+        // len == 23 (mini + '?')
+        w5 = ((beu32)input[20] << 24) | ((beu32)input[21] << 16) | ((beu32)input[22] << 8) | 0x00000080;
+    }
+
+    // Remaining words are zeros; last word is bit-length (len * 8).
+    sha256Kernel(hash,
+        w0, w1, w2, w3, w4, w5,
+        0, 0, 0, 0, 0, 0, 0, 0,      // w6..w13
+        0,                           // w14
+        len * 8                      // w15 = bit length
+    );
+}
+
+// returns how many trailing positions [21, 21-d+1] changed (>=1)
+__device__ __forceinline__ int incrementDigits_retDepth(uint8_t d[22]) {
+    for (int j = 21; j >= 1; --j) {
+        if (d[j] < 57) { d[j]++; return 21 - j + 1; }
+        d[j] = 0;
+    }
+    return 21; // overflow ignored by CPU range cap
+}
+
+__device__ __forceinline__ void addUint64ToDigits_ascii(uint8_t d[22], char m[22], uint64_t add, const char* __restrict__ b58) {
+    uint64_t carry = add;
+    for (int j = 21; j >= 1 && carry; --j) {
+        uint64_t v = (uint64_t)d[j] + (carry % 58ULL);
+        d[j] = (uint8_t)(v % 58ULL);
+        carry = (carry / 58ULL) + (v / 58ULL);
+    }
+    // build ascii once
+    m[0] = 'S';
+#pragma unroll
+    for (int j = 1; j < 22; ++j) m[j] = b58[d[j]];
+}
+
+__device__ __forceinline__ void dbg_print_tid_tix_mini(
+    uint64_t tid, uint64_t tIx, const char mini[22], int bx, int tx)
+{
+    // Make a null-terminated copy of mini for printf
+    char miniZ[23];
+#pragma unroll
+    for (int i = 0; i < 22; ++i) miniZ[i] = mini[i];
+    miniZ[22] = '\0';
+
+    // Device printf supports %llu for unsigned long long
+    printf("[b%d t%d] tid=%llu tIx=%llu mini=%s\n",
+        bx, tx, (unsigned long long)tid, (unsigned long long)tIx, miniZ);
+}
+
+
+// === MINI-KEY KERNEL =======================================================
+// Grid-stride over THREAD_STEPS per-thread starting from base-58 digit-array `startDigits`.
+// We synthesize ASCII "S................." from digits, test SHA256(mini + '?')[0] == 0x00,
+// and if valid, store priv32 = SHA256(mini) into unifiedKey and set isResultFlag.
+__global__ void kernelMini(
+    int gpuIx,
+    uint8_t* __restrict__ unifiedKey,
+    int* __restrict__ isResultFlag,
+    const uint8_t* __restrict__ startDigits,
+    int threadNumberOfChecks,
+    unsigned long long* __restrict__ foundOffset)
+{
+    // load & offset
+    uint8_t digits[22];
+#pragma unroll
+    for (int i = 0; i < 22; ++i) digits[i] = startDigits[i];
+
+    const uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t tIx = tid * (uint64_t)threadNumberOfChecks;
+
+    char mini[22];
+    addUint64ToDigits_ascii(digits, mini, tIx, _b58Alphabet); // builds initial ASCII once
+
+    unsigned mask = __activemask();
+
+    for (int i = 0; i < threadNumberOfChecks; ++i) {
+        // sha256(mini + '?')
+        char miniQ[23];
+#pragma unroll
+        for (int j = 0; j < 22; ++j) miniQ[j] = mini[j];
+        miniQ[22] = '?';
+
+        beu32 h[8];
+        sha256MiniBlock(miniQ, 23, h);
+
+        // check first byte
+        uint8_t b0 = (uint8_t)(h[0] >> 24); // adjust if your sha returns LE
+        int local_hit = (b0 == 0);
+
+        if (__any_sync(mask, local_hit)) {
+            if (local_hit) {
+                beu32 p[8];
+                sha256MiniBlock(mini, 22, p);
+                dbg_print_tid_tix_mini(tid, tIx, mini, blockIdx.x, threadIdx.x);
+                if (atomicCAS(isResultFlag, 0, 1) == 0) {
+#pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        unifiedKey[k * 4 + 0] = (uint8_t)(p[k] >> 24);
+                        unifiedKey[k * 4 + 1] = (uint8_t)(p[k] >> 16);
+                        unifiedKey[k * 4 + 2] = (uint8_t)(p[k] >> 8);
+                        unifiedKey[k * 4 + 3] = (uint8_t)(p[k] >> 0);
+                    }
+                    *foundOffset = tIx + (uint64_t)i;
+                    __threadfence_system();
+                }
+            }
+            return;
+        }
+
+        // next candidate: update only changed tail
+        int depth = incrementDigits_retDepth(digits);
+#pragma unroll
+        for (int j = 22 - depth; j < 22; ++j) mini[j] = _b58Alphabet[digits[j]];
+
+        if ((i & 31) == 0 && *isResultFlag) return;
+    }
+}
+
+
 
 __global__ void kernelUncompressed(bool* buffResult, bool* buffCollectorWork, uint64_t* const __restrict__ buffRangeStart, const int threadNumberOfChecks, const uint32_t checksum) {
     uint64_t _start[5];

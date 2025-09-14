@@ -33,3 +33,25 @@ __device__ void initShared();
 __device__ __inline__ void summaryShared(const int gpuIx, uint32_t* unifiedResult, bool* isResultFlag);
 
 cudaError_t loadStride(uint64_t* stride);
+
+
+// === Mini-key kernels (GPU) ================================================
+
+// Scans a chunk of mini-keys starting from base-58 digit array `startDigits`.
+// If it finds a valid mini-key (SHA256(mini + '?')[0] == 0x00), it writes the
+// derived priv32 (SHA256(mini)) to `unifiedKey[32]`, sets *isResultFlag = true,
+// and returns immediately (one winning key per launch).
+__global__ void kernelMini(
+    const int gpuIx,
+    uint8_t* unifiedKey,      // [out] priv32 if found
+    bool* isResultFlag,    // [out] set to true if a key is found
+    uint8_t* __restrict__ startDigits, // [in] 22 base-58 indexes (0..57), 'S' is implied
+    const int threadNumberOfChecks
+);
+
+// Collector used by other modes; leave as-is if already present.
+__global__ void resultCollector(bool* buffResult, uint64_t* buffCombinedResult, const uint64_t threadsInBlockNumberOfChecks);
+
+// SHA-256 chunk function from your lib; already included via "lib/hash/sha256.cu"
+__device__ void sha256Kernel(beu32* const hash, C16(COMMA, EMPTY));
+
